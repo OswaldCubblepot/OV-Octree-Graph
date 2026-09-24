@@ -1,0 +1,6 @@
+opencv-python
+Pillow
+gradio-image-prompter
+sentencepiece
+torch
+flash-attn
