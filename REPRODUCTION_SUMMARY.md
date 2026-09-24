@@ -1,8 +1,21 @@
 # OV-Octree-Graph 论文复现总结
 
-> ICCV 2025 — *Open-Vocabulary Octree-Graph for 3D Scene Understanding*
-> arXiv: 2411.16253 | 代码仓库: https://github.com/yifeisu/OV-Octree-Graph
-> 复现日期: 2026-09-21
+> **ICCV 2025** — *Open-Vocabulary Octree-Graph for 3D Scene Understanding*
+> arXiv: [2411.16253](https://arxiv.org/abs/2411.16253)
+>
+> - 原始仓库（约 80% 完整）：https://github.com/yifeisu/OV-Octree-Graph
+> - 补齐后仓库：https://github.com/OswaldCubblepot/OV-Octree-Graph
+> - 复现日期：2026-09-21（代码补齐）→ 2026-09-24（端到端复现完成）
+
+---
+
+## 〇、结论摘要
+
+原仓库只发布了约 80% 的代码：**八叉树模块（octree-graph / 检索 / 路径规划）完全没有实现**，vocab 类别特征文件缺失，且存在若干导致 ScanNet 检索 / 实例评测直接崩溃的 bug。本次工作：
+
+1. **补全了缺失的 20%**（新增 4 个文件 + 修改 12 个文件），把整条 pipeline 从"数据加载 → 八叉树图 → 下游任务"完全接通；
+2. 在 **WSL2 + RTX 4060 (8GB)** 上完成 **Replica 端到端复现**，语义分割 **mIoU 0.3158**（论文 0.320，误差约 1.3%）；
+3. 渲染 8 个场景 × {预测 / GT / 八叉树} 共 **24 张结果图**，输出在 `renders/`，指标在 `results/`。
 
 ---
 
@@ -64,9 +77,9 @@
 
 ---
 
-## 三、本次复现补齐的内容
+## 三、相对原仓库的代码改动（补全 20%）
 
-### 新增文件（4 个，均通过合成场景端到端测试）
+### 3.1 新增文件（4 个，均通过合成场景端到端测试）
 
 | 文件 | 内容 |
 |---|---|
@@ -75,7 +88,7 @@
 | `scripts/generate_vocab_features.py` | 复现缺失的 vocab 特征（OVSeg 协议 = OpenAI CLIP ViT-L/14 + ImageNet 提示词集成，不需要 OVSeg 权重；`*_clip_h_14` 用 open_clip ViT-H-14） |
 | `scripts/octree_demo.py` | `info / retrieve / occupancy / plan` 四个下游任务演示；内置零依赖配置解析器（omegaconf → yaml → 内建解析逐级降级），无需 `pip install -e .` 即可运行 |
 
-### 修改文件（12 个）
+### 3.2 修改文件（12 个）
 
 - `ovgraph/scene/scene_replica.py` / `scene_scannet.py`：新增 `build_octree_graph()` 方法；`rep_dif_denoise` 增加 None 保护（`feature_name: feature` 时返回 None，调用方保留均值特征）；修复 `evaluate_retrieval` 的 `cfg.model.*` → 正确的路径与文件名；`top1_cls` 改用 `CLASS_LABELS_20`
 - `scripts/replica_build.py` / `scannet_build.py`：接通完整链路——ScanNet 启用 `evaluate_retrieval()` + `evaluate_segmentation_20_opt()`，两者末尾都调用 `build_octree_graph()`
@@ -87,17 +100,75 @@
 
 ---
 
-## 四、如何运行
+## 四、端到端复现：环境搭建与运行期修复
 
-### 4.1 完整论文复现（需要 Linux + CUDA）
+除上面 20% 的代码补全外，为了让原代码在真实环境跑起来，还做了一批**运行期/环境修复**（这些同样是"相对原仓库"的改变，原代码在标准环境里根本无法直接跑通）。
 
-当前机器是 Windows + 系统 Python 3.12（无 torch）。README 的安装步骤全部是 Linux 指令，detectron2 / CropFormer 在 Windows 上很难编译，**建议用 WSL2 或 Linux 机器**：
+### 4.1 复现环境
+
+| 项 | 值 |
+|---|---|
+| 系统 | Windows 11 + **WSL2**（Ubuntu） |
+| Python | conda env `ovgraph`，Python 3.10 |
+| PyTorch | 2.1.2 + cu118 |
+| CUDA | 11.8 工具链（nvcc 11.8 + gcc-11 + cuda-cccl 的 thrust/cub 头，`TORCH_CUDA_ARCH_LIST=8.9`） |
+| GPU | NVIDIA RTX 4060（**8GB 显存**，因此单卡顺序跑） |
+
+### 4.2 依赖 / 构建修复
+
+| 问题 | 修复 |
+|---|---|
+| `pip install mmcv==2.1.0` 在无 `CUDA_HOME` 时构建失败 | 改 `mmcv-lite==2.1.0`（推理只需 `import mmcv`） |
+| setuptools ≥81 移除 `pkg_resources`，旧 setup.py（ovclip、mmcv）构建即崩 | `pip install --no-build-isolation`（含一切 setup.py 里 `import torch` 的包：detectron2/chamferdist/gradslam） |
+| `tokenize-anything` 可编辑安装不生成 `tokenize_anything/version.py` | 手写 `version.py`（`version = "1.1.0a0"`） |
+| CUDA 11.8 缺 `thrust`/`cub` 头 | 从 `cuda-cccl` 补 `include/{thrust,cub,cuda,nv}` |
+
+### 4.3 运行期关键修复
+
+| 问题 | 表现 | 修复 |
+|---|---|---|
+| **flash-attn 无法编译** | 原代码 `except ImportError` 后把 `apply_rotary_emb`/`flash_attn_func`/`flash_attn_with_kvcache` 置为 `None`，调用即崩 | 在 `3rdparty/tokenize-anything/tokenize_anything/modeling/text_decoder.py` 手写等价的**纯 PyTorch 因果注意力 + 旋转位置编码**回退（与手动 causal softmax 逐元素对比误差 0.0） |
+| **OVSeg 污染 CropFormer 的 detectron2 注册表** | 第 2 个场景起报 `KeyError: 'multi_scale_pixel_decoder'` | OVSeg 导入时 monkeypatch fvcore `Registry._do_register` 为"后者覆盖前者"，把 CropFormer 的 `MaskFormerHead` 覆盖掉。在 `3rdparty/ovseg/open_vocab_seg/__init__.py` 改回 last-wins；同时 `multiprocessing.Pool(..., maxtasksperchild=1)` 让每个场景独立进程 |
+| **8GB 显存 OOM** | CropFormer 与 OVSeg 两个模型同时驻留显存 | `ovgraph/scene/scene_replica.py` 在 `generate_2d_proposals`/`compute_2d_feature` 末尾 `del self.detector`/`del self.extractor` + `torch.cuda.empty_cache()` |
+| **Replica 网格 PLY 解析失败** | Replica mesh PLY 的自定义 face 布局让 open3d RPly 报错 | `ovgraph/scene/scene_replica.py` 改用 `plyfile.PlyData.read()` |
+| **`No module named 'datasets'`** | `datasets` 是仓库根的 namespace package（无 `__init__.py`），可编辑安装不覆盖它 | 启动时 `export PYTHONPATH=/mnt/d/OV-Octree-Graph-main:$PYTHONPATH` |
+
+---
+
+## 五、复现结果
+
+### 5.1 Replica 语义分割（`results/*-segment.csv`）
+
+| 场景 | mIoU | f-mIoU | mAcc | pAcc |
+|---|---|---|---|---|
+| room0 | 0.3745 | 0.6164 | 0.5283 | 0.7541 |
+| room1 | 0.3524 | 0.5152 | 0.5820 | 0.6564 |
+| room2 | 0.3603 | 0.5387 | 0.4406 | 0.5773 |
+| office0 | 0.2983 | 0.6360 | 0.3518 | 0.7130 |
+| office1 | 0.2027 | 0.3426 | 0.2305 | 0.3517 |
+| office2 | 0.3069 | 0.6656 | 0.3351 | 0.7343 |
+| office3 | 0.2325 | 0.4860 | 0.3898 | 0.6216 |
+| office4 | 0.3991 | 0.5880 | 0.4411 | 0.6552 |
+| **平均** | **0.3158** | 0.5485 | 0.4124 | 0.6329 |
+
+> 论文报告 Replica 语义分割 **mIoU = 0.320**，本次复现 **0.3158**，相对误差约 **1.3%**，基本一致。
+
+### 5.2 结果渲染图
+
+8 个场景 × {预测 `_pred` / 真值 `_gt` / 八叉树图 `_octree`} 共 **24 张**，输出到 `renders/*.png`（open3d OffscreenRenderer，EGL 在 WSL 下可用）。
+
+---
+
+## 六、如何运行
+
+### 6.1 完整论文复现（Linux + CUDA）
 
 ```bash
 # 1. conda 环境（按 README 1.1~1.3 节）
 conda create -n ovgraph python=3.10
 # 安装 torch 2.1.2(cu118) + detectron2 + CropFormer(Entity) + OVSeg + TAP + gradslam
 # 注：pytorch3d、faiss、torch-scatter、flash-attn、MinkowskiEngine 主流程实际用不到（仅死代码引用），可先跳过
+# 关键：mmcv 用 mmcv-lite，安装统一加 --no-build-isolation，tokenize-anything 手写 version.py
 
 # 2. 下载权重（README 2.5 节）：CropFormer、OVSeg、TAP 三个权重到 pretrained_weights/
 
@@ -108,7 +179,8 @@ python scripts/generate_vocab_features.py --models l14vild,h14
 #    Replica：公开，按 README 3 节组织到 data/replica
 #    ScanNet：需签协议，运行 tools/preprocess_scannet.py
 
-# 5. 构建 + 评测
+# 5. 构建 + 评测（WSL 下需先 export PYTHONPATH）
+export PYTHONPATH=/path/to/OV-Octree-Graph-main:$PYTHONPATH
 bash run/replica_build.sh                      # Replica（含语义分割评测 + 八叉树图）
 python scripts/replica_eval_semantic_segment.py
 bash run/scannet_bulid.sh                      # ScanNet（含检索/语义评测 + 八叉树图）
@@ -117,7 +189,7 @@ python scripts/scannet_eval_instance_segment.py
 python scripts/scannet_eval_instance_segment_class_agnostic.py
 ```
 
-### 4.2 八叉树图下游任务（演示，轻量依赖）
+### 6.2 八叉树图下游任务（演示，轻量依赖）
 
 八叉树模块本身只需要 numpy/scipy/networkx，构建完成后即可用：
 
@@ -153,7 +225,11 @@ python scripts/octree_demo.py --config configs/scannet/scannet_cropformer_ovseg_
 | `ovgraph/utils/metric.py` | 检索 AP、语义分割 mIoU 等评测指标 |
 | `ovgraph/detector/CropFormer/inference.py` | CropFormer 检测器封装 |
 | `ovgraph/extractor/OVSeg/inference.py` | OVSeg + TAP 特征提取器封装 |
+| `3rdparty/tokenize-anything/.../text_decoder.py` | **修改**：flash-attn 纯 PyTorch 回退 |
+| `3rdparty/ovseg/open_vocab_seg/__init__.py` | **修改**：fvcore 注册表 last-wins，避免覆盖 CropFormer |
 | `scripts/*_build.py` / `scripts/*_eval*.py` | 构建与评测入口 |
 | `scripts/generate_vocab_features.py` | **新增**：生成缺失的类别文本特征 |
 | `scripts/octree_demo.py` | **新增**：下游任务演示 |
 | `configs/*/*.yaml` | 管线配置（含新增 `octree` 段） |
+| `results/` | 本次复现的指标 CSV（`segment.csv` 平均 mIoU 0.3158） |
+| `renders/` | 本次复现的 24 张结果图 |
